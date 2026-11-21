@@ -64,9 +64,11 @@ can see the transfer is working from either screen.
 
 ## Features
 
-- **Custom file picker** (Add files…): a wide in-app dialog listing one file
-  per line as `name    size` in a single column, with Ctrl/Shift multi-select
-  (or Select all/none), folder navigation, and an option to show all files.
+- **Custom file picker** (Add files…): a two-pane in-app dialog. The top pane
+  is a folder tree — click any folder (Home, Inbox, filesystem root, or any
+  subfolder) to list its files in the pane below. Files appear one per line as
+  `name    size`; Ctrl/Shift-click or Select all/none choose multiple files.
+  A search box filters by name. No nested OS dialog windows.
 - **Whole-folder subtree scanning** and individual file selection.
 - **Multi-select** with Ctrl/Shift-click. Selecting any row greys out
   **Send all** so you cannot accidentally send the whole list when you meant

@@ -115,103 +115,143 @@ class SafariTransferWorker(threading.Thread):
 
 
 class FilePicker(tk.Toplevel):
-    """Custom file picker with a wide, single-column, multi-select list.
+    """Two-pane file picker: folder tree on top, multi-select file list below.
 
-    Shows one file per line as 'name    size' — no separate columns.  Ctrl/Shift
-    click (or the Select all/none buttons) choose multiple files.  Keeps the
-    user inside the app instead of the OS file dialog, which is cramped under
-    X forwarding and has an unfamiliar multi-column layout.
+    Click any folder in the top tree to list its files underneath.  The tree
+    loads subfolders lazily as you expand them.  Files are shown one per line
+    as 'name    size' in a single wide column; Ctrl/Shift-click selects several.
     """
 
     def __init__(self, parent: tk.Tk, initial_dir: Path | None = None):
         super().__init__(parent)
         self.title(f"{APP_NAME} — Add files")
-        self.geometry("940x620")
-        self.minsize(680, 420)
+        self.geometry("960x680")
+        self.minsize(700, 500)
         self.transient(parent)
         self.grab_set()
         self.resizable(True, True)
 
         self.result: list[Path] = []
-        self.dir_var = tk.StringVar()
-        self.only_var = tk.BooleanVar(value=True)
-        start = initial_dir if initial_dir and initial_dir.is_dir() else Path.home()
-        self.dir_var.set(str(start))
-
-        # ---- directory row ----
-        nav = ttk.Frame(self, padding=(10, 10, 10, 4))
-        nav.pack(fill=tk.X)
-        ttk.Label(nav, text="Folder:").pack(side=tk.LEFT)
-        entry = ttk.Entry(nav, textvariable=self.dir_var)
-        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
-        entry.bind("<Return>", lambda _e: self._go_to_entry())
-        ttk.Button(nav, text="Go", command=self._go_to_entry).pack(side=tk.LEFT, padx=2)
-        ttk.Button(nav, text="Parent", command=self._go_parent).pack(side=tk.LEFT, padx=2)
-        ttk.Button(nav, text="Browse…", command=self._browse).pack(side=tk.LEFT, padx=2)
-
-        # ---- list ----
-        frame = ttk.Frame(self, padding=(10, 4))
-        frame.pack(fill=tk.BOTH, expand=True)
-        self.tree = ttk.Treeview(
-            frame, columns=("details",), show="headings", height=18,
-            selectmode="extended",
+        self.current_dir = (
+            initial_dir if initial_dir and initial_dir.is_dir() else Path.home()
         )
-        self.tree.heading("details", text="File  (Ctrl/Shift-click to select multiple)")
-        self.tree.column("details", anchor=tk.W, width=860, stretch=True)
-        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree.bind("<Double-1>", lambda _e: self._add_selected())
+        self.search_var = tk.StringVar()
+        self.only_var = tk.BooleanVar(value=True)
+        self._loaded_dirs: set[str] = set()
+        self.search_var.trace_add("write", lambda *_a: self._show_files(self.current_dir))
 
-        # ---- options / buttons ----
+        # ---- top pane: folder tree ----
+        dir_frame = ttk.LabelFrame(self, text="1. Folders — click one to list its files below", padding=(8, 4))
+        dir_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 4))
+
+        self.dirtree = ttk.Treeview(dir_frame, show="tree", selectmode="browse", height=9)
+        dscroll = ttk.Scrollbar(dir_frame, orient=tk.VERTICAL, command=self.dirtree.yview)
+        self.dirtree.configure(yscrollcommand=dscroll.set)
+        self.dirtree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        dscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.dirtree.bind("<<TreeviewOpen>>", self._on_dir_open)
+        self.dirtree.bind("<<TreeviewSelect>>", self._on_dir_select)
+
+        # Roots: Home, the watched inbox, and the filesystem root.
+        self._add_dir_node("", Path.home(), "Home")
+        if INBOX_DIR.is_dir() and INBOX_DIR != Path.home():
+            self._add_dir_node("", INBOX_DIR, "Inbox")
+        self._add_dir_node("", Path("/"), "/ (filesystem root)")
+
+        # ---- bottom pane: files in the selected folder ----
+        file_frame = ttk.LabelFrame(self, text="2. Files — Ctrl/Shift-click to select multiple", padding=(8, 6))
+        file_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 4))
+
+        bar = ttk.Frame(file_frame)
+        bar.pack(fill=tk.X, pady=(0, 4))
+        self.path_label = ttk.Label(bar, text=str(self.current_dir), foreground="#555555")
+        self.path_label.pack(side=tk.LEFT, anchor=tk.W)
+        ttk.Label(bar, text="Search:").pack(side=tk.RIGHT)
+        ttk.Entry(bar, textvariable=self.search_var, width=22).pack(side=tk.RIGHT, padx=(4, 6))
+
+        self.filetree = ttk.Treeview(file_frame, columns=("details",), show="headings", height=10,
+                                     selectmode="extended")
+        self.filetree.heading("details", text="Name    Size")
+        self.filetree.column("details", anchor=tk.W, width=880, stretch=True)
+        fscroll = ttk.Scrollbar(file_frame, orient=tk.VERTICAL, command=self.filetree.yview)
+        self.filetree.configure(yscrollcommand=fscroll.set)
+        self.filetree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        fscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.filetree.bind("<Double-1>", lambda _e: self._add_selected())
+
+        # ---- buttons ----
         bottom = ttk.Frame(self, padding=(10, 6, 10, 10))
         bottom.pack(fill=tk.X)
         ttk.Checkbutton(
             bottom, text="Show only supported files", variable=self.only_var,
-            command=self._refresh,
+            command=lambda: self._show_files(self.current_dir),
         ).pack(side=tk.LEFT)
         ttk.Button(bottom, text="Select all", command=self._select_all).pack(side=tk.LEFT, padx=(12, 2))
         ttk.Button(bottom, text="Select none", command=self._select_none).pack(side=tk.LEFT, padx=2)
         ttk.Button(bottom, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=2)
         ttk.Button(bottom, text="Add selected", command=self._add_selected).pack(side=tk.RIGHT, padx=2)
 
-        self._refresh()
+        # Show the starting folder and select it in the tree when possible.
+        self._show_files(self.current_dir)
+        start_iid = str(self.current_dir)
+        if self.dirtree.exists(start_iid):
+            self.dirtree.selection_set(start_iid)
+            self.dirtree.focus(start_iid)
+            self.dirtree.see(start_iid)
         self.wait_window(self)
 
-    def _go_to_entry(self) -> None:
-        path = Path(self.dir_var.get()).expanduser()
-        if path.is_dir():
-            self.dir_var.set(str(path))
-            self._refresh()
-
-    def _go_parent(self) -> None:
-        path = Path(self.dir_var.get()).expanduser()
-        if path.parent != path:
-            self.dir_var.set(str(path.parent))
-            self._refresh()
-
-    def _browse(self) -> None:
-        folder = filedialog.askdirectory(
-            title="Choose folder", initialdir=self.dir_var.get(), parent=self
-        )
-        if folder:
-            self.dir_var.set(folder)
-            self._refresh()
-
-    def _refresh(self) -> None:
-        self.tree.delete(*self.tree.get_children())
-        path = Path(self.dir_var.get()).expanduser()
-        if not path.is_dir():
-            self._insert("(folder not found — use Browse…)", "", "")
+    # ---- folder tree helpers --------------------------------------------- #
+    def _add_dir_node(self, parent_iid: str, path: Path, label: str) -> None:
+        """Insert a directory node with a dummy child so it shows an arrow."""
+        iid = str(path)
+        if self.dirtree.exists(iid):
             return
+        self.dirtree.insert(parent_iid, tk.END, iid=iid, text=label, open=False)
+        self.dirtree.insert(iid, tk.END, iid="dummy:" + iid, text="")
+
+    def _on_dir_open(self, _event: tk.Event) -> None:
+        iid = self.dirtree.focus()
+        if not iid or iid in self._loaded_dirs or not self.dirtree.exists(iid):
+            return
+        self._loaded_dirs.add(iid)
+        for child in self.dirtree.get_children(iid):
+            self.dirtree.delete(child)
         try:
-            entries = sorted(path.iterdir(), key=lambda p: (not p.is_file(), p.name.lower()))
-        except OSError as exc:
-            self._insert(f"(cannot read folder: {exc})", "", "")
+            dirs = sorted(
+                (p for p in Path(iid).iterdir() if p.is_dir()),
+                key=lambda p: p.name.lower(),
+            )
+        except OSError:
+            return
+        for p in dirs:
+            self._add_dir_node(iid, p, p.name)
+
+    def _on_dir_select(self, _event: tk.Event) -> None:
+        selected = self.dirtree.selection()
+        if not selected:
+            return
+        path = Path(selected[0])
+        if path.is_dir():
+            self.current_dir = path
+            self.search_var.set("")
+            self._show_files(path)
+
+    # ---- file list helpers ------------------------------------------------ #
+    def _show_files(self, path: Path) -> None:
+        self.current_dir = path
+        self.path_label.configure(text=str(path))
+        self.filetree.delete(*self.filetree.get_children())
+        if not path.is_dir():
+            return
+        query = self.search_var.get().strip().lower()
+        try:
+            entries = sorted(path.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
             return
         for p in entries:
             if not p.is_file():
+                continue
+            if query and query not in p.name.lower():
                 continue
             if self.only_var.get() and p.suffix.lower() not in SUPPORTED_EXTS:
                 continue
@@ -219,24 +259,20 @@ class FilePicker(tk.Toplevel):
                 size = human_size(p.stat().st_size)
             except OSError:
                 size = "?"
-            self._insert(p.name, size, str(p))
-
-    def _insert(self, name: str, size: str, full_path: str) -> None:
-        self.tree.insert(
-            "", tk.END, iid=full_path or name,
-            values=(f"{name}    {size}" if size else name,),
-        )
+            self.filetree.insert("", tk.END, iid=str(p), values=(f"{p.name}    {size}",))
 
     def _select_all(self) -> None:
-        self.tree.selection_set(self.tree.get_children())
+        self.filetree.selection_set(self.filetree.get_children())
 
     def _select_none(self) -> None:
-        self.tree.selection_remove(self.tree.selection())
+        self.filetree.selection_remove(self.filetree.selection())
 
     def _add_selected(self) -> None:
-        selected = self.tree.selection()
-        self.result = [Path(p) for p in selected if p and Path(p).is_file()]
-        self.destroy()
+        self.result = [
+            Path(i) for i in self.filetree.selection() if Path(i).is_file()
+        ]
+        if self.result:
+            self.destroy()
 
 
 class DoneDialog(tk.Toplevel):
