@@ -1,0 +1,12 @@
+# Generated environment / bundled runtime (created by install_deps.sh / run.sh)
+.venv/
+.tk/
+
+# Runtime data
+inbox/*
+!inbox/.gitkeep
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
